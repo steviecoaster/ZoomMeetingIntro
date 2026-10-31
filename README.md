@@ -97,6 +97,11 @@ Add `WhatIf = $true` to the splat. The script prints what it would do, including
 
 When it finishes, the script prints a summary showing the output path, duration, resolution, the date used and how long the encode took.
 
+Audio is rendered in a separate pass, then copied into the final video without another audio encode.
+This avoids a reproducible FFmpeg 9 issue where processing audio and video together can end the audio
+early (at 12:24 in a tested Zoom recording). Audio duration is checked before video encoding and after
+muxing. Temporary audio is removed when processing finishes; the original recording is unchanged.
+
 ---
 
 ## 5. Parameters

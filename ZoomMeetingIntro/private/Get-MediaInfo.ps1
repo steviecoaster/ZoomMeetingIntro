@@ -3,7 +3,7 @@ function Get-MediaInfo {
 
     $probeArgs = @(
         '-v', 'error'
-        '-show_entries', 'stream=codec_type,width,height,avg_frame_rate,r_frame_rate,sample_rate:format=duration'
+        '-show_entries', 'stream=codec_type,width,height,avg_frame_rate,r_frame_rate,sample_rate,duration:format=duration'
         '-of', 'json'
         $Path
     )
@@ -27,6 +27,9 @@ function Get-MediaInfo {
         Height     = [int]$video.height
         Fps        = $fps
         HasAudio   = [bool]$audio
+        AudioDuration = if ($audio.duration -and $audio.duration -ne 'N/A') {
+            [double]::Parse($audio.duration, [System.Globalization.CultureInfo]::InvariantCulture)
+        } else { $null }
         SampleRate = if ($audio.sample_rate) { [int]$audio.sample_rate } else { 48000 }
         Duration   = [double]::Parse($data.format.duration, $inv)
     }

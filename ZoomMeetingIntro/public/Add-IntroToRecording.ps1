@@ -179,7 +179,23 @@ $keepBefore = (-not $TrimBefore) -and ($start -gt 0.05)
 
 # --- Meeting date overlay ----------------------------------------------------------------------
 $dateText = $null
-$workDir = $null
+$workSplat = @{
+    Path = [System.IO.Path]::GetTempPath()
+    ChildPath = 'meeting_intro_' + [guid]::NewGuid().ToString('N')
+}
+$dirSplat = @{
+    ItemType = 'Directory'
+    Path = Join-Path @workSplat
+    WhatIf = $false
+}
+$workDir = (New-Item @dirSplat).FullName
+$audioPath = Join-Path -Path $workDir -ChildPath 'audio.m4a'
+$cleanupSplat = @{
+    LiteralPath = $workDir
+    Recurse = $true
+    WhatIf = $false
+    ErrorAction = 'SilentlyContinue'
+}
 $dateFilter = ''
 if (-not $NoDate) {
     $dateText = $MeetingDate.ToString($DateFormat)
@@ -189,16 +205,6 @@ if (-not $NoDate) {
     # ffmpeg filter options choke on drive-letter colons, commas and apostrophes, so the font and the
     # date text are placed in a temp folder under plain names and ffmpeg is run from that folder.
     # (WhatIf = $false so these temp-file steps still run under -WhatIf)
-    $workSplat = @{
-        Path      = [System.IO.Path]::GetTempPath()
-        ChildPath = 'meeting_intro_' + [guid]::NewGuid().ToString('N')
-    }
-    $dirSplat = @{
-        ItemType = 'Directory'
-        Path     = Join-Path @workSplat
-        WhatIf   = $false
-    }
-    $workDir = (New-Item @dirSplat).FullName
     $copySplat = @{
         LiteralPath = $FontPath
         Destination = Join-Path -Path $workDir -ChildPath ('datefont' + [System.IO.Path]::GetExtension($FontPath))
@@ -223,12 +229,6 @@ if (-not $NoDate) {
 
     # Timing matches the intro's built-in animation: fades in at 5.8s, out with the fade to black at 8.2s
     $alpha = "'if(lt(t,5.8),0,min(1,min((t-5.8)/0.7,(9-t)/0.8)))'"
-    $cleanupSplat = @{
-        LiteralPath = $workDir
-        Recurse     = $true
-        WhatIf      = $false
-        ErrorAction = 'SilentlyContinue'
-    }
     $dateFilter = "drawtext=fontfile=${fontName}:textfile=date.txt:fontsize=34:fontcolor=0xBEC8DC:x=(w-text_w)/2:y=970-th/2:alpha=${alpha},"
 }
 
@@ -250,66 +250,87 @@ if (-not $keepBefore -and $start -gt 0) {
 }
 $ffArgs.AddRange([string[]]@('-i', $RecordingPath, '-i', $IntroPath))
 
+# Render audio in its own process. A shared video/audio graph can prematurely end the recording's
+# audio on FFmpeg 9 even when the source audio is complete. Separate concat filters alone do not help.
+$audioArgs = [System.Collections.Generic.List[string]]::new()
+$audioArgs.AddRange($ffArgs)
 # Input 2: silence, only if the recording has no audio track
 if (-not $rec.HasAudio) {
-    $ffArgs.AddRange([string[]]@('-f', 'lavfi', '-i', "anullsrc=r=${sr}:cl=stereo"))
+    $audioArgs.AddRange([string[]]@('-f', 'lavfi', '-i', "anullsrc=r=${sr}:cl=stereo"))
 }
 $recAudio = if ($rec.HasAudio) { '0:a' } else { '2:a' }
 
 $filters = [System.Collections.Generic.List[string]]::new()
+$audioFilters = [System.Collections.Generic.List[string]]::new()
 $segments = [System.Collections.Generic.List[string]]::new()
+$audioSegments = [System.Collections.Generic.List[string]]::new()
 
 # Intro (normalised to match the recording)
-$introAudio = if ($intro.HasAudio) { "[1:a]$anorm[ia]" } else { "anullsrc=r=${sr}:cl=stereo,atrim=0:$(Format-Seconds -Seconds $intro.Duration),$anorm[ia]" }
-$filters.Add("[1:v]$dateFilter$norm[iv]")
-$filters.Add($introAudio)
+$introLen = Format-Seconds -Seconds $intro.Duration
+$introAudio = if ($intro.HasAudio) { "[1:a]$anorm" } else { "anullsrc=r=${sr}:cl=stereo,$anorm" }
+$filters.Add("[1:v]$dateFilter$norm,setpts=PTS-STARTPTS[iv]")
+$audioFilters.Add("$introAudio,asetpts=PTS-STARTPTS,apad,atrim=duration=${introLen}[ia]")
 
 $afterStart = Format-Seconds -Seconds ($start - $offset)
 $afterEnd = Format-Seconds -Seconds ($end - $offset)
 $afterLen = Format-Seconds -Seconds ($end - $start)
 $fadeOutAt = Format-Seconds -Seconds ([math]::Max(0, $start - $FadeSeconds))
+$recAudioNorm = "$anorm,apad,atrim=duration=$(Format-Seconds -Seconds ($rec.Duration - $offset))"
 
 if ($keepBefore) {
     $filters.Add("[0:v]$norm,split=2[v0][v1]")
-    $filters.Add("[${recAudio}]$anorm,asplit=2[a0][a1]")
+    $audioFilters.Add("[${recAudio}]$recAudioNorm,asplit=2[a0][a1]")
     $beforeV = "[v0]trim=0:$(Format-Seconds -Seconds $start),setpts=PTS-STARTPTS"
-    $beforeA = "[a0]atrim=0:$(Format-Seconds -Seconds $start),asetpts=PTS-STARTPTS"
+    $beforeA = "[a0]atrim=0:$(Format-Seconds -Seconds $start),asetpts=PTS-STARTPTS,apad,atrim=duration=$(Format-Seconds -Seconds $start)"
     if ($FadeSeconds -gt 0) {
         $beforeV += ",fade=t=out:st=${fadeOutAt}:d=${fade}"
         $beforeA += ",afade=t=out:st=${fadeOutAt}:d=${fade}"
     }
     $filters.Add("$beforeV[bv]")
-    $filters.Add("$beforeA[ba]")
-    $segments.Add('[bv][ba]')
+    $audioFilters.Add("$beforeA[ba]")
+    $segments.Add('[bv]')
+    $audioSegments.Add('[ba]')
     $srcV = '[v1]'
     $srcA = '[a1]'
 }
 else {
     $srcV = "[0:v]$norm,"
-    $srcA = "[${recAudio}]$anorm,"
+    $srcA = "[${recAudio}]$recAudioNorm,"
 }
 $afterV = "${srcV}trim=${afterStart}:${afterEnd},setpts=PTS-STARTPTS"
-$afterA = "${srcA}atrim=${afterStart}:${afterEnd},asetpts=PTS-STARTPTS"
+$afterA = "${srcA}atrim=${afterStart}:${afterEnd},asetpts=PTS-STARTPTS,apad,atrim=duration=${afterLen}"
 if ($FadeSeconds -gt 0) {
     $afterV += ",fade=t=in:st=0:d=${fade}"
     $afterA += ",afade=t=in:st=0:d=${fade}"
 }
 $filters.Add("$afterV[av]")
-$filters.Add("$afterA[aa]")
+$audioFilters.Add("$afterA[aa]")
 
-$segments.Add('[iv][ia]')
-$segments.Add('[av][aa]')
-$filters.Add(('{0}concat=n={1}:v=1:a=1[outv][outa]' -f ($segments -join ''), $segments.Count))
+$segments.Add('[iv]')
+$segments.Add('[av]')
+$audioSegments.Add('[ia]')
+$audioSegments.Add('[aa]')
+$filters.Add(('{0}concat=n={1}:v=1:a=0[outv]' -f ($segments -join ''), $segments.Count))
+$audioFilters.Add(('{0}concat=n={1}:v=0:a=1[outa]' -f ($audioSegments -join ''), $audioSegments.Count))
+
+$audioArgs.AddRange([string[]]@(
+    '-filter_complex', ($audioFilters -join ';')
+    '-map', '[outa]', '-vn'
+    '-c:a', 'aac', '-b:a', '160k', '-ar', "$sr"
+    $audioPath
+))
 
 $ffArgs.AddRange([string[]]@(
+    '-i', $audioPath
     '-filter_complex', ($filters -join ';')
-    '-map', '[outv]', '-map', '[outa]'
+    '-map', '[outv]', '-map', '2:a:0'
     '-c:v', 'libx264', '-preset', $Preset, '-crf', "$Crf", '-pix_fmt', 'yuv420p'
-    '-c:a', 'aac', '-b:a', '160k', '-ar', "$sr"
+    '-c:a', 'copy'
     '-movflags', '+faststart'
     $OutputPath
 ))
 
+Write-Verbose -Message ("ffmpeg (audio pass) " + ($audioArgs -join ' '))
 Write-Verbose -Message ("ffmpeg " + ($ffArgs -join ' '))
 
 if (-not $PSCmdlet.ShouldProcess($OutputPath, "Insert intro dated '$dateText' at $Timestamp")) {
@@ -319,6 +340,14 @@ else {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     if ($workDir) { Push-Location -LiteralPath $workDir }
     try {
+        & ffmpeg @audioArgs
+        if ($LASTEXITCODE -ne 0) { throw "ffmpeg audio pass failed with exit code $LASTEXITCODE." }
+        $renderedAudio = Get-MediaInfo -Path $audioPath
+        $expectedAudioDuration = $intro.Duration + ($end - $start) + $(if ($keepBefore) { $start } else { 0 })
+        if (-not $renderedAudio.HasAudio -or $null -eq $renderedAudio.AudioDuration -or
+            $renderedAudio.AudioDuration -lt ($expectedAudioDuration - 0.1)) {
+            throw 'The rendered audio ended early. Video encoding was canceled to avoid an incomplete soundtrack.'
+        }
         & ffmpeg @ffArgs
         if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed with exit code $LASTEXITCODE." }
     }
@@ -331,6 +360,10 @@ else {
     $sw.Stop()
 
     $final = Get-MediaInfo -Path $OutputPath
+    if (-not $final.HasAudio -or $null -eq $final.AudioDuration -or
+        $final.AudioDuration -lt ($expectedAudioDuration - 0.1)) {
+        throw "The output audio ended early. The incomplete output is at '$OutputPath'."
+    }
     [pscustomobject]@{
         OutputPath    = $OutputPath
         Duration      = [TimeSpan]::FromSeconds($final.Duration).ToString('hh\:mm\:ss')
