@@ -43,8 +43,11 @@ function Add-IntroToRecording {
 .PARAMETER NoDate
     Don't stamp a date on the intro.
 
+.PARAMETER Message
+    Optional message to show under "psoh.io". When combined with the date, it appears above the date.
+
 .PARAMETER FontPath
-    Font used for the date. Defaults to Poppins Light if installed (matches the intro), then Segoe UI Light, then Arial.
+    Font used for the date/message. Defaults to Poppins Light if installed (matches the intro), then Segoe UI Light, then Arial.
 
 .PARAMETER FadeSeconds
     Length of the fade between the recording and the intro. Default 0.5. Use 0 for hard cuts.
@@ -109,6 +112,10 @@ param(
     [Parameter()]
     [switch]
     $NoDate,
+
+    [Parameter()]
+    [string]
+    $Message,
 
     [Parameter()]
     [string]
@@ -179,6 +186,7 @@ $keepBefore = (-not $TrimBefore) -and ($start -gt 0.05)
 
 # --- Meeting date overlay ----------------------------------------------------------------------
 $dateText = $null
+$messageText = if ([string]::IsNullOrWhiteSpace($Message)) { $null } else { $Message }
 $workSplat = @{
     Path = [System.IO.Path]::GetTempPath()
     ChildPath = 'meeting_intro_' + [guid]::NewGuid().ToString('N')
@@ -196,9 +204,11 @@ $cleanupSplat = @{
     WhatIf = $false
     ErrorAction = 'SilentlyContinue'
 }
-$dateFilter = ''
+$overlayFilters = [System.Collections.Generic.List[string]]::new()
 if (-not $NoDate) {
     $dateText = $MeetingDate.ToString($DateFormat)
+}
+if ($dateText -or $messageText) {
     if (-not $FontPath) { $FontPath = Find-DateFont }
     $FontPath = (Resolve-Path -LiteralPath $FontPath).ProviderPath
 
@@ -212,24 +222,33 @@ if (-not $NoDate) {
     }
     Copy-Item @copySplat
     $fontName = Split-Path -Path $copySplat.Destination -Leaf
-    $dateFile = Join-Path -Path $workDir -ChildPath 'date.txt'
-    $writeSplat = @{
-        LiteralPath = $dateFile
-        Value       = $dateText
-        Encoding    = 'utf8NoBOM'
-        NoNewline   = $true
-        WhatIf      = $false
-    }
-    if ($PSVersionTable.PSVersion.Major -lt 6) {
-        [System.IO.File]::WriteAllText($dateFile, $dateText, [System.Text.UTF8Encoding]::new($false))
-    }
-    else {
-        Set-Content @writeSplat
-    }
-
     # Timing matches the intro's built-in animation: fades in at 5.8s, out with the fade to black at 8.2s
     $alpha = "'if(lt(t,5.8),0,min(1,min((t-5.8)/0.7,(9-t)/0.8)))'"
-    $dateFilter = "drawtext=fontfile=${fontName}:textfile=date.txt:fontsize=34:fontcolor=0xBEC8DC:x=(w-text_w)/2:y=970-th/2:alpha=${alpha},"
+    foreach ($overlay in @(
+        @{ Text = $messageText; FileName = 'message.txt'; Y = $(if ($dateText) { 'h*0.88' } else { 'h*0.95' }) }
+        @{ Text = $dateText; FileName = 'date.txt'; Y = 'h*0.95' }
+    )) {
+        if (-not $overlay.Text) { continue }
+        $textFile = Join-Path -Path $workDir -ChildPath $overlay.FileName
+        if ($PSVersionTable.PSVersion.Major -lt 6) {
+            [System.IO.File]::WriteAllText($textFile, $overlay.Text, [System.Text.UTF8Encoding]::new($false))
+        }
+        else {
+            $writeSplat = @{
+                LiteralPath = $textFile
+                Value       = $overlay.Text
+                Encoding    = 'utf8NoBOM'
+                NoNewline   = $true
+                WhatIf      = $false
+            }
+            Set-Content @writeSplat
+        }
+        $overlayFilters.Add("drawtext=fontfile=${fontName}:textfile=$($overlay.FileName):fontsize=34:fontcolor=0xBEC8DC:x=(w-text_w)/2:y=$($overlay.Y)-th/2:alpha=${alpha}")
+    }
+    $dateFilter = if ($overlayFilters.Count -gt 0) { ($overlayFilters -join ',') + ',' } else { '' }
+}
+else {
+    $dateFilter = ''
 }
 
 Write-Verbose -Message ("Recording: {0}x{1} @ {2}fps, audio {3}Hz, {4}s" -f $rec.Width, $rec.Height, $fps, $sr, (Format-Seconds -Seconds $rec.Duration))
@@ -333,7 +352,11 @@ $ffArgs.AddRange([string[]]@(
 Write-Verbose -Message ("ffmpeg (audio pass) " + ($audioArgs -join ' '))
 Write-Verbose -Message ("ffmpeg " + ($ffArgs -join ' '))
 
-if (-not $PSCmdlet.ShouldProcess($OutputPath, "Insert intro dated '$dateText' at $Timestamp")) {
+$overlayDescription = @()
+if ($messageText) { $overlayDescription += $messageText }
+if ($dateText) { $overlayDescription += $dateText }
+$overlayDescription = if ($overlayDescription.Count -gt 0) { $overlayDescription -join ' / ' } else { 'without overlay text' }
+if (-not $PSCmdlet.ShouldProcess($OutputPath, "Insert intro with '$overlayDescription' at $Timestamp")) {
     if ($workDir) { Remove-Item @cleanupSplat }
 }
 else {
@@ -369,6 +392,7 @@ else {
         Duration      = [TimeSpan]::FromSeconds($final.Duration).ToString('hh\:mm\:ss')
         Resolution    = '{0}x{1}' -f $final.Width, $final.Height
         MeetingDate   = $dateText
+        Message       = $messageText
         IntroStartsAt = [TimeSpan]::FromSeconds($(if ($keepBefore) { $start } else { 0 })).ToString('hh\:mm\:ss')
         Elapsed       = $sw.Elapsed.ToString('hh\:mm\:ss')
     }

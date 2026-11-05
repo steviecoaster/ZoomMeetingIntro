@@ -1,6 +1,6 @@
 # ZoomMeetingIntro
 
-Adds an intro video (with the meeting date) to Zoom recordings. The included sample intro is branded for the Ohio PowerShell User Group; use `-IntroPath` to supply your group's own intro video.
+Adds an intro video (with an optional meeting date and/or message) to Zoom recordings. The included sample intro is branded for the Ohio PowerShell User Group; use `-IntroPath` to supply your group's own intro video.
 
 | File | What it is |
 |---|---|
@@ -91,6 +91,21 @@ $stitchParams = @{
 Add-IntroToRecording @stitchParams
 ```
 
+### Show a custom message instead of the date
+
+```powershell
+$stitchParams = @{
+    RecordingPath = '.\meeting.mp4'
+    Timestamp     = '3:05'
+    Message       = 'Welcome, everyone!'
+    NoDate        = $true
+    TrimBefore    = $true
+}
+Add-IntroToRecording @stitchParams
+```
+
+Omit `NoDate` to show both the message and date; the message appears above the date.
+
 ### Preview without encoding anything
 
 Add `WhatIf = $true` to the splat. The script prints what it would do, including the date it picked, and doesn't encode anything.
@@ -115,7 +130,8 @@ muxing. Temporary audio is removed when processing finishes; the original record
 | `MeetingDate` | auto | See "How the date is picked" below. |
 | `DateFormat` | `MMMM d, yyyy` | .NET date format. `dddd, MMMM d, yyyy` gives "Thursday, November 12, 2026". |
 | `NoDate` | off | Leaves the date line blank. |
-| `FontPath` | auto | Font for the date. Tries Poppins Light, then Segoe UI Light, then Arial. |
+| `Message` | *(none)* | Optional custom text under the logo. When a date is also shown, the message appears above it. Use with `NoDate` to show only the message. |
+| `FontPath` | auto | Font for the date/message. Tries Poppins Light, then Segoe UI Light, then Arial. |
 | `OutputPath` | `<yyyy-MM-dd>_with_intro.mp4` | Uses the meeting date (explicit or detected) and saves next to the original by default. |
 | `IntroPath` | *(required)* | The path to the intro video to splice onto the recording |
 | `FadeSeconds` | `0.5` | Fade length between the recording and the intro. `0` gives hard cuts. |
